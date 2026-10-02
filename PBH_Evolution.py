@@ -1,0 +1,370 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+from scipy.special import expit
+
+# --------------------------------------------------
+# Physical constants (SI)
+# --------------------------------------------------
+G = 6.67430e-11
+c = 2.99792458e8
+hbar = 1.054571817e-34
+kB = 1.380649e-23
+sigma = 5.670374419e-8
+
+# --------------------------------------------------
+# Cosmology
+# --------------------------------------------------
+
+H0 = 2.2e-18
+Omega_r0 = 1e-3
+Omega_m0 = 0.3
+Omega_L0 = 0.7
+
+gamma = 0.2
+f_c = 4.0/27.0
+
+rho_crit0 = 3 * H0**2 / (8 * np.pi * G)
+
+
+def H(z):
+    zp1 = 1 + z
+    return H0 * np.sqrt(
+        Omega_r0 * zp1**4 +
+        Omega_m0 * zp1**3 +
+        Omega_L0
+    )
+
+
+def dH_dz(z):
+    zp1 = 1 + z
+
+    F = (
+        Omega_r0 * zp1**4 +
+        Omega_m0 * zp1**3 +
+        Omega_L0
+    )
+
+    dF = (
+        4 * Omega_r0 * zp1**3 +
+        3 * Omega_m0 * zp1**2
+    )
+
+    return H0 * dF / (2 * np.sqrt(F))
+
+
+def rho_background(z):
+    return rho_crit0 * (
+        Omega_r0 * (1 + z)**4 +
+        Omega_m0 * (1 + z)**3 +
+        Omega_L0
+    )
+
+
+# --------------------------------------------------
+# Exact McVittie apparent horizon (numerically stabilized)
+# --------------------------------------------------
+
+def get_rA_mcvittie(M, z):
+    Hz = H(z)
+    arg = (3.0 * np.sqrt(3.0) * G * M * Hz) / (c**3)
+
+    if arg >= 1.0:
+        return np.nan
+
+    # Numerical stability check for late times / small H.
+    # When arg is far below machine precision (~1e-16), arccos(-arg) rounds
+    # to exactly pi/2 and the resulting cos(...) is contaminated by
+    # floating-point noise at the ~1e-17 level. Multiplying by c/H then
+    # blows that noise up into a horizon radius many orders of magnitude
+    # too large, which artificially kills the Hawking temperature and
+    # shuts off evaporation. Below this threshold we instead use the
+    # analytic small-arg limit, which asymptotes exactly to the
+    # Schwarzschild radius.
+    if arg < 1e-6:
+        return (2.0 * G * M) / (c**2)  # Asymptotes exactly to Schwarzschild
+
+    # Exact trigonometric root for early universe / large arg
+    theta = np.arccos(-arg)
+    return (2.0 * c / (np.sqrt(3.0) * Hz)) * np.cos((theta + 4.0 * np.pi) / 3.0)
+
+
+# --------------------------------------------------
+# Surface gravity
+# --------------------------------------------------
+
+def kappa_mcvittie(M, z, rA):
+    Hz = H(z)
+    return (
+        G * M / rA**2
+        - rA * Hz**2
+        + c * (1 + z) / 2 * dH_dz(z)
+    )
+
+
+# --------------------------------------------------
+# Mass evolution in x = ln(1+z)
+# --------------------------------------------------
+
+M_ref = 1.0e17  # kg, numerical scaling only
+M_min = 1.0e-12  # kg
+
+
+def compute_rates(M, z):
+    """
+    Shared physics core: given (M, z), return the quantities needed both
+    by the RHS of the ODE and by the "about-to-evaporate" event below, so
+    the two never drift out of sync.
+    """
+    Hz = H(z)
+
+    # Schwarzschild radius
+    r_s = 2 * G * M / c**2
+
+    # Hubble radius
+    r_H = c / Hz
+
+    ratio = r_s / r_H
+
+    # Smooth transition
+    w = expit(
+        np.log10(ratio + 1e-300)
+        - np.log10(1e-4)
+    )
+
+    # --------------------------------------------------
+    # McVittie quantities
+    # --------------------------------------------------
+    rA_mc = get_rA_mcvittie(M, z)
+
+    if not np.isfinite(rA_mc):
+        rA_mc = r_s
+
+    kap_mc = kappa_mcvittie(M, z, rA_mc)
+
+    TH_mc = (
+        hbar * kap_mc / (2 * np.pi * c * kB)
+        if kap_mc > 0
+        else 0.0
+    )
+
+    # --------------------------------------------------
+    # Schwarzschild quantities
+    # --------------------------------------------------
+    rA_sch = r_s
+
+    TH_sch = (
+        hbar * c**3
+        / (8 * np.pi * G * M * kB)
+    )
+
+    # --------------------------------------------------
+    # Hybrid quantities
+    # --------------------------------------------------
+    rA = w * rA_mc + (1 - w) * rA_sch
+    TH = w * TH_mc + (1 - w) * TH_sch
+
+    # --------------------------------------------------
+    # Evaporation
+    # --------------------------------------------------
+    dMdt_evap = (
+        -4 * np.pi * rA**2 * sigma * TH**4 / c**2
+    )
+
+    # --------------------------------------------------
+    # Accretion
+    # --------------------------------------------------
+    dMdt_acc = (
+        4 * np.pi * rA**2
+        * f_c
+        * rho_background(z)
+        * c
+    )
+
+    dMdt = dMdt_evap + dMdt_acc
+
+    return Hz, rA, TH, dMdt_evap, dMdt_acc, dMdt
+
+
+def dlnM_dx(x, y):
+
+    # Recover z and M
+    z = np.exp(x) - 1
+    M = M_ref * np.exp(y[0])
+
+    if M <= M_min or not np.isfinite(M):
+        return [0.0]
+
+    Hz, rA, TH, dMdt_evap, dMdt_acc, dMdt = compute_rates(M, z)
+
+    # dM/dz
+    dMdz = -dMdt / (Hz * (1 + z))
+
+    # dx/dz = 1/(1+z)
+    # dM/dx = (1+z) dM/dz
+    dMdx = (1 + z) * dMdz
+
+    # Since M = M_ref exp(y):
+    # dM/dx = M dy/dx
+    dydx = dMdx / M
+
+    return [dydx]
+
+
+# --------------------------------------------------
+# Events: evaporation
+# --------------------------------------------------
+#
+# evaporated_event catches the (rare) case where the ODE genuinely
+# integrates M down to M_min without trouble.
+#
+# lifetime_event catches the much more common case for light PBHs:
+# once the *local* remaining evaporation lifetime,
+#     tau_remaining ~= M / (3 * |dMdt_evap|)
+# (from dM/dt = -k/M^2 => M^3(t) linear in t => t_remaining = M^3/(3k)),
+# becomes a tiny fraction of the local Hubble time 1/H(z), the hole
+# finishes evaporating over a Delta-z that is numerically zero. Trying
+# to resolve that burst while integrating in x = ln(1+z) is a genuine
+# finite-time blow-up at fixed x, which is why solve_ivp was failing
+# with "Required step size is less than spacing between numbers." -
+# the integrator wasn't broken, it was being asked to resolve an
+# instantaneous (on Hubble timescales) event. Instead we detect that
+# the hole is effectively finished and stop there, exactly like a
+# vertical drop to M_min at that redshift.
+
+LIFETIME_HUBBLE_FRACTION = 1e-6
+
+
+def evaporated_event(x, y):
+    M = M_ref * np.exp(y[0])
+    return M - M_min
+
+
+evaporated_event.terminal = True
+evaporated_event.direction = -1
+
+
+def lifetime_event(x, y):
+    z = np.exp(x) - 1
+    M = M_ref * np.exp(y[0])
+
+    if M <= M_min or not np.isfinite(M):
+        return -1.0
+
+    Hz, rA, TH, dMdt_evap, dMdt_acc, dMdt = compute_rates(M, z)
+
+    if dMdt_evap >= 0:
+        return 1.0  # not currently losing mass; nothing to trigger
+
+    tau_remaining = M / (3.0 * abs(dMdt_evap))
+    tau_hubble = 1.0 / Hz
+
+    return tau_remaining - LIFETIME_HUBBLE_FRACTION * tau_hubble
+
+
+lifetime_event.terminal = True
+lifetime_event.direction = -1
+
+# --------------------------------------------------
+# Initial masses
+# --------------------------------------------------
+
+initial_masses_g = [1e15,2e15,1.65e14,1.5e14,1e13,1e12]
+
+# --------------------------------------------------
+# Plot
+# --------------------------------------------------
+
+plt.figure(figsize=(10, 6))
+
+for M_g in initial_masses_g:
+
+    M_in = M_g * 1e-3  # g -> kg
+
+    # Formation redshift
+    z_in = (
+        np.sqrt(
+            gamma * c**3
+            / (2 * G * H0 * np.sqrt(Omega_r0) * M_in)
+        )
+        - 1
+    )
+
+    # Transform z -> x
+    x_in = np.log1p(z_in)
+    x_final = np.log1p(1e-10)
+
+    # Initial logarithmic mass
+    y0 = [np.log(M_in / M_ref)]
+
+    solution = solve_ivp(
+        dlnM_dx,
+        (x_in, x_final),
+        y0,
+        method="Radau",
+        events=[evaporated_event, lifetime_event],
+        rtol=1e-10,
+        atol=1e-12,
+        max_step=1e-3
+    )
+
+    if not solution.success:
+        print(
+            f"WARNING: integration for M_in={M_g:.3e} g did not reach "
+            f"x_final cleanly (status={solution.status}: {solution.message})"
+        )
+
+    # Recover z and M
+    x_vals = solution.t
+    z_vals = np.expm1(x_vals)
+
+    M_vals_g = (
+        M_ref * np.exp(solution.y[0])
+        * 1e3
+    )
+
+    # If the lifetime event fired, the hole is effectively fully
+    # evaporated at that redshift on any timescale this plot can
+    # resolve; append a point at M_min so the curve visibly drops
+    # instead of just stopping mid-air.
+    if len(solution.t_events[1]) > 0:
+        x_vals = np.append(x_vals, solution.t_events[1][0])
+        z_vals = np.expm1(x_vals)
+        M_vals_g = np.append(M_vals_g, M_min * 1e3)
+
+    mask = (
+        (z_vals > 0) &
+        np.isfinite(M_vals_g) &
+        (M_vals_g > 0)
+    )
+
+    plt.plot(
+        z_vals[mask],
+        M_vals_g[mask],
+        lw=2,
+        label=f"$M_{{in}}={M_g:.2e}$ g"
+    )
+
+# --------------------------------------------------
+# Formatting
+# --------------------------------------------------
+
+plt.xscale("log")
+plt.yscale("log")
+plt.gca().invert_xaxis()
+
+plt.xlabel("Redshift $z$")
+plt.ylabel("PBH Mass $M$ [g]")
+plt.title("PBH Evolution: Accretion + Hawking Evaporation")
+
+plt.grid(True, which="both", ls="--", alpha=0.5)
+plt.legend()
+plt.tight_layout()
+
+plt.savefig(
+    "PBH_accretion_evaporation_high_precision.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
